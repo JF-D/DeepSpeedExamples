@@ -64,6 +64,8 @@ def add_model_config_args(parser):
                                    help='Run optimizer on CPU')
     group.add_argument('--cpu_torch_adam', action='store_true',
                                    help='Use Torch Adam as optimizer on CPU.')
+    group.add_argument('--no-fuse-adam', action='store_true',
+                       help='Use Torch Adam as optimizer insted of FusedAdam.')
 
     return parser
 
@@ -174,6 +176,10 @@ def add_training_args(parser):
     group.add_argument('--local_rank', type=int, default=None,
                        help='local rank passed from distributed launcher')
 
+    group.add_argument('--timeline', action='store_true')
+    group.add_argument('--launch', type=str, default=None)
+    group.add_argument('--master-addr', type=str, default='localhost')
+    group.add_argument('--port', type=str, default='12355')
     return parser
 
 
@@ -302,6 +308,7 @@ def add_data_args(parser):
                        help='Maximum number of predictions to use per sequence.'
                        'Defaults to math.ceil(`--seq-length`*.15/10)*10.'
                        'MUST BE SPECIFIED IF `--use-tfrecords` is True.')
+    group.add_argument('--synthetic', action='store_true')
 
     return parser
 

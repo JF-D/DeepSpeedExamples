@@ -20,8 +20,10 @@ USE_TORCH_DDP = False
 
 from datetime import datetime
 import os
+import re
 import random
 import math
+import time
 import numpy as np
 import torch
 
@@ -40,7 +42,6 @@ if USE_TORCH_DDP:
 else:
     from model import DistributedDataParallel as DDP
 import mpu
-from apex.optimizers import FusedAdam as Adam
 from utils import Timers
 from utils import save_checkpoint
 from utils import load_checkpoint
@@ -111,7 +112,13 @@ def get_optimizer(model, args):
                 param.model_parallel = False
 
     # Use FusedAdam.
-    optimizer = Adam(param_groups,
+    if args.no_fuse_adam:
+        from torch.optim import Adam
+        optimizer = Adam(param_groups,
+                         lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        from apex.optimizers import FusedAdam as Adam
+        optimizer = Adam(param_groups,
                          lr=args.lr, weight_decay=args.weight_decay)
 
     print(f'Optimizer = {optimizer.__class__.__name__}')
@@ -121,7 +128,7 @@ def get_optimizer(model, args):
 
     # Wrap into fp16 optimizer.
     if args.fp16:
-        
+
         optimizer = FP16_Optimizer(optimizer,
                                    static_loss_scale=args.loss_scale,
                                    dynamic_loss_scale=args.dynamic_loss_scale,
@@ -166,6 +173,7 @@ def setup_model_and_optimizer(args):
 
         model, optimizer, _, lr_scheduler = deepspeed.initialize(
             model=model,
+            optimizer=optimizer,
             model_parameters=param_groups,
             args=args,
             lr_scheduler=lr_scheduler,
@@ -250,6 +258,25 @@ def get_batch(data_iterator, args, timers):
     # Items and their type.
     keys = ['text']
     datatype = torch.int64
+
+    if args.synthetic:
+        timers('data loader').start()
+        if not data_iterator.initialized:
+            datas_ = data_iterator.data
+            tokens = datas_[:, :-1].contiguous()
+            labels = datas_[:, 1:].contiguous()
+            # Get the masks and postition ids.
+            attention_mask, loss_mask, position_ids = get_masks_and_position_ids(
+                tokens,
+                args.eod_token,
+                args.reset_position_ids,
+                args.reset_attention_mask)
+
+            data_iterator.initialize(tokens, labels, loss_mask, attention_mask, position_ids)
+
+        tokens, labels, loss_mask, attention_mask, position_ids = next(data_iterator)
+        timers('data loader').stop()
+        return tokens, labels, loss_mask, attention_mask, position_ids
 
     # Broadcast data.
     timers('data loader').start()
@@ -393,6 +420,86 @@ def train_step(data_iterator, model, optimizer, lr_scheduler,
 
     return lm_loss_reduced, skipped_iter
 
+def benchmark(model, optimizer, lr_scheduler, train_data_iterator, timers, args):
+    """Train the model."""
+
+    # Turn on training mode which enables dropout.
+    model.train()
+
+    # warmup
+    for _ in range(5):
+        lm_loss, skipped_iter = train_step(train_data_iterator,
+                                           model,
+                                           optimizer,
+                                           lr_scheduler,
+                                           args, timers)
+
+    torch.cuda.synchronize()
+    st = time.perf_counter()
+    for i in range(10):
+        lm_loss, skipped_iter = train_step(train_data_iterator,
+                                           model,
+                                           optimizer,
+                                           lr_scheduler,
+                                           args, timers)
+    torch.cuda.synchronize()
+    ed = time.perf_counter()
+    print(f'Speed: {(ed - st) * 1000 / 10:.3f}ms/iter')
+
+    if args.timeline:
+        torch.cuda.cudart().cudaProfilerStart()
+        for i in range(5):
+            lm_loss, skipped_iter = train_step(train_data_iterator,
+                                           model,
+                                           optimizer,
+                                           lr_scheduler,
+                                           args, timers)
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStop()
+        exit()
+
+    # Iterations.
+    iteration = args.iteration
+    skipped_iters = 0
+
+    timers('interval time').start()
+    report_memory_flag = True
+    while iteration < 15:
+
+        lm_loss, skipped_iter = train_step(train_data_iterator,
+                                           model,
+                                           optimizer,
+                                           lr_scheduler,
+                                           args, timers)
+        skipped_iters += skipped_iter
+        iteration += 1
+
+        # Logging.
+        if iteration % args.log_interval == 0:
+            learning_rate = optimizer.param_groups[0]['lr']
+            elapsed_time = timers('interval time').elapsed()
+            log_string = ' iteration {:8d}/{:8d} |'.format(iteration,
+                                                            args.train_iters)
+            log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
+                elapsed_time * 1000.0 / args.log_interval)
+            log_string += ' learning rate {:.3E} |'.format(learning_rate)
+            if args.fp16:
+                log_string += ' loss scale {:.1f} |'.format(
+                    optimizer.cur_scale if args.deepspeed else optimizer.loss_scale)
+            print_rank_0(log_string)
+            if report_memory_flag:
+                report_memory('after {} iterations'.format(iteration))
+                report_memory_flag = False
+            if USE_TORCH_DDP:
+                timers.log(['forward', 'backward', 'optimizer',
+                            'batch generator', 'data loader'],
+                           normalizer=args.log_interval)
+            else:
+                timers.log(['forward', 'backward', 'allreduce', 'optimizer',
+                            'batch generator', 'data loader'],
+                           normalizer=args.log_interval)
+
+    return iteration, skipped_iters
 
 def train(model, optimizer, lr_scheduler,
           train_data_iterator, val_data_iterator, timers, args):
@@ -548,25 +655,64 @@ def set_deepspeed_activation_checkpointing(args):
 
 def initialize_distributed(args):
     """Initialize torch.distributed."""
-
-    if args.deepspeed:
+    if args.deepspeed and args.launch is None:
         deepspeed.init_distributed(dist_backend=args.distributed_backend)
     else:
-        # Manually set the device ids.
-        device = args.rank % torch.cuda.device_count()
-        # Call the init process
-        init_method = 'tcp://'
-        master_ip = os.getenv('MASTER_ADDR', 'localhost')
-        master_port = os.getenv('MASTER_PORT', '6000')
-        init_method += master_ip + ':' + master_port
-        torch.distributed.init_process_group(
-            backend=args.distributed_backend,
-            world_size=args.world_size, rank=args.rank,
-            init_method=init_method)
+        if args.launch == 'slurm':
+            rank = int(os.environ['SLURM_PROCID'])
+            world_size = int(os.environ['SLURM_NTASKS'])
+            local_rank = int(os.environ['SLURM_LOCALID'])
+            node_list = str(os.environ['SLURM_NODELIST'])
+            node_parts = re.findall('[0-9]+', node_list)
+
+            os.environ[
+                'MASTER_ADDR'] = f'{node_parts[1]}.{node_parts[2]}.{node_parts[3]}.{node_parts[4]}'
+            os.environ['MASTER_PORT'] = str(args.port)
+            os.environ['WORLD_SIZE'] = str(world_size)
+            os.environ['RANK'] = str(rank)
+            os.environ["LOCAL_RANK"] = str(local_rank)
+
+            if args.deepspeed:
+                deepspeed.init_distributed()
+            else:
+                torch.distributed.init_process_group(backend='nccl')
+        elif args.launch == 'mpirun':
+            local_rank = int(os.environ.get('OMPI_COMM_WORLD_LOCAL_RANK', 0))
+            rank = int(os.environ.get('OMPI_COMM_WORLD_RANK', 0))
+            world_size = int(os.environ.get('OMPI_COMM_WORLD_SIZE', 1))
+            os.environ['MASTER_ADDR'] = args.master_addr
+            os.environ['MASTER_PORT'] = args.port
+            os.environ['WORLD_SIZE'] = str(world_size)
+            os.environ['RANK'] = str(rank)
+            os.environ["LOCAL_RANK"] = str(local_rank)
+
+            if args.deepspeed:
+                deepspeed.init_distributed()
+            else:
+                torch.distributed.init_process_group(backend='nccl')
+        else:
+            args.rank = int(os.getenv('RANK', '0'))
+            args.world_size = int(os.getenv("WORLD_SIZE", '1'))
+            if args.rank == 0:
+                print(f'Launch with {args.launch} ...')
+
+            # Manually set the device ids.
+            device = args.rank % torch.cuda.device_count()
+            # Call the init process
+            init_method = 'tcp://'
+            master_ip = os.getenv('MASTER_ADDR', 'localhost')
+            master_port = os.getenv('MASTER_PORT', '6000')
+            init_method += master_ip + ':' + master_port
+            torch.distributed.init_process_group(
+                backend=args.distributed_backend,
+                world_size=args.world_size, rank=args.rank,
+                init_method=init_method)
 
     if args.local_rank is not None:
         device = args.local_rank
     torch.cuda.set_device(device)
+    if args.rank == 0:
+        print(os.environ)
 
     # Set the model-parallel / data-parallel communicators.
     mpu.initialize_model_parallel(args.model_parallel_size)
@@ -587,10 +733,66 @@ def set_random_seed(seed):
         mpu.model_parallel_cuda_manual_seed(seed)
 
 
+class SyntheticDL:
+    def __init__(self, batch_size, seq_length, vocab_size):
+        self.batch_size = batch_size
+        self.seq_length = seq_length
+        self.vacab_size = vocab_size
+
+        size = (self.batch_size, self.seq_length + 1)
+        self.data = torch.randint(0, vocab_size, size, dtype=torch.int64)
+
+        self.initialized = False
+
+    def initialize(self, tokens, labels, loss_mask, attention_mask, position_ids):
+        self.initialized = True
+        self.tokens = tokens.cuda()
+        self.labels = labels.cuda()
+        self.loss_mask = loss_mask.cuda()
+        self.attention_mask = attention_mask.cuda()
+        self.position_ids = position_ids.cuda()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.initialized:
+            return self.tokens, self.labels, self.loss_mask, self.attention_mask, self.position_ids
+        else:
+            return None
+
+
 def get_train_val_test_data(args):
     """Load the data on rank zero and boradcast number of tokens to all GPUS."""
 
     (train_data, val_data, test_data) = (None, None, None)
+    if args.synthetic:
+        train_data = SyntheticDL(args.batch_size, args.seq_length, args.vocab_size)
+        flags = torch.cuda.LongTensor([1, 0, 0])
+
+        # Broadcast num tokens.
+        torch.distributed.broadcast(flags,
+                                    mpu.get_model_parallel_src_rank(),
+                                    group=mpu.get_model_parallel_group())
+        args.do_train = flags[0].item()
+        args.do_valid = flags[1].item()
+        args.do_test = flags[2].item()
+
+        num_tokens = args.vocab_size
+        eod_token = num_tokens - 1
+
+        before = num_tokens
+        after = before
+        multiple = args.make_vocab_size_divisible_by * \
+                   mpu.get_model_parallel_world_size()
+        while (after % multiple) != 0:
+            after += 1
+        print_rank_0('> padded vocab (size: {}) with {} dummy '
+                     'tokens (new size: {})'.format(
+                         before, after - before, after))
+        print_rank_0('> found end-of-document token: {}'.format(eod_token))
+
+        return train_data, None, None, after, eod_token
 
     # Data loader only on rank 0 of each model parallel group.
     if mpu.get_model_parallel_rank() == 0:
@@ -678,6 +880,14 @@ def main():
         val_data_iterator = iter(val_data)
     else:
         val_data_iterator = None
+
+    if args.synthetic:
+        benchmark(model, optimizer, lr_scheduler, train_data_iterator,
+                  timers, args)
+        args.do_train = False
+        args.do_valid = False
+        args.save = False
+        args.do_test = False
 
     #TODO: figure out how to properly set this especially when resuming training
     iteration = 0
