@@ -17,6 +17,7 @@
 
 import argparse
 import os
+import re
 import torch
 import deepspeed
 
@@ -348,6 +349,23 @@ def get_args():
         args.local_rank = local_rank
         args.rank = nodeid*local_size + local_rank
         args.world_size = num_nodes*local_size
+    elif os.getenv('SLURM_PROCID'):
+        rank = int(os.environ['SLURM_PROCID'])
+        world_size = int(os.environ['SLURM_NTASKS'])
+        local_rank = int(os.environ['SLURM_LOCALID'])
+        node_list = str(os.environ['SLURM_NODELIST'])
+        node_parts = re.findall('[0-9]+', node_list)
+
+        os.environ[
+            'MASTER_ADDR'] = f'{node_parts[1]}.{node_parts[2]}.{node_parts[3]}.{node_parts[4]}'
+        os.environ['MASTER_PORT'] = str(args.port)
+        os.environ['WORLD_SIZE'] = str(world_size)
+        os.environ['RANK'] = str(rank)
+        os.environ["LOCAL_RANK"] = str(local_rank)
+
+        args.local_rank = local_rank
+        args.rank = rank
+        args.world_size = world_size
 
     args.model_parallel_size = min(args.model_parallel_size, args.world_size)
     if args.rank == 0:
