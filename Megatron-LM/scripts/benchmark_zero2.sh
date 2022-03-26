@@ -8,17 +8,18 @@ NUM_GPUS_PER_WORKER=8
 script_path=$(realpath $0)
 script_dir=$(dirname $script_path)
 
-nlayer=12
+nlayer=48
 seq_length=1024
-hidden_size=1024
+hidden_size=1600
 nheads=16
+vocab_size=50257
 
 ndev=8
 
-bs=1
-MP_SIZE=1
+bs=2
+MP_SIZE=4
 
-checkpoint= #"--checkpoint-activations --deepspeed-activation-checkpointing"
+checkpoint="--checkpoint-activations --deepspeed-activation-checkpointing"
 
 config_json="$script_dir/benchmark_zero2_config.json"
 gpt_options=" \
@@ -28,6 +29,7 @@ gpt_options=" \
        --num-attention-heads ${nheads} \
        --batch-size ${bs} \
        --seq-length ${seq_length} \
+       --vocab-size ${vocab_size} \
        --max-position-embeddings ${seq_length} \
        --train-iters 100000 \
        --train-data webtext \
@@ -51,8 +53,8 @@ gpt_options="${gpt_options}
 "
 
 
-# run_cmd="NCCL_DEBUG=INFO deepspeed --num_nodes ${NUM_WORKERS} --num_gpus ${NUM_GPUS_PER_WORKER} pretrain_gpt2.py $@ ${gpt_options}"
-run_cmd="NCCL_DEBUG=INFO /home/duanjiangfei/env/openmpi-2.1.6-cuda-10.1/bin/mpirun -np ${ndev} --map-by socket python -u pretrain_gpt2.py $@ ${gpt_options} --launch mpirun"
+run_cmd="deepspeed --num_nodes ${NUM_WORKERS} --num_gpus ${NUM_GPUS_PER_WORKER} pretrain_gpt2.py $@ ${gpt_options}"
+# run_cmd="NCCL_DEBUG=INFO /home/duanjiangfei/env/openmpi-2.1.6-cuda-10.1/bin/mpirun -np ${ndev} python -u pretrain_gpt2.py $@ ${gpt_options} --launch mpirun"
 echo ${run_cmd}
 eval ${run_cmd}
 
