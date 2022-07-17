@@ -14,12 +14,17 @@ hidden_size=1600
 nheads=16
 vocab_size=50257
 
-ndev=8
+ndev=$1
+PROF=$2
 
-bs=2
-MP_SIZE=4
+g=$(($ndev<8?$ndev:8))
+
+bs=1
+MP_SIZE=1
 
 checkpoint="--checkpoint-activations --deepspeed-activation-checkpointing"
+
+prefix="zero_dp"
 
 config_json="$script_dir/benchmark_zero2_config.json"
 gpt_options=" \
@@ -52,9 +57,19 @@ gpt_options="${gpt_options}
                --deepspeed_config ${config_json} \
 "
 
+CMD_PREFIX=""
+CMD_SUFFIX=""
+if [ "${PROF}" = "profile" ]; then
+    export LD_LIBRARY_PATH=/nvme/platform/dep/cuda11.0-cudnn8.0/nsight-systems-2020.3.2/target-linux-x64:$LD_LIBRARY_PATH
+    CMD_PREFIX="/nvme/platform/dep/cuda11.0-cudnn8.0/bin/nsys profile -t cudnn,cuda,osrt,nvtx \
+                --output log/nvvp/gpt_n${ndev}_%q{SLURM_PROCID} --force-overwrite true"
+    CMD_SUFFIX="--timeline"
+fi
 
-run_cmd="deepspeed --num_nodes ${NUM_WORKERS} --num_gpus ${NUM_GPUS_PER_WORKER} pretrain_gpt2.py $@ ${gpt_options}"
+# run_cmd="deepspeed --num_nodes ${NUM_WORKERS} --num_gpus ${NUM_GPUS_PER_WORKER} pretrain_gpt2.py $@ ${gpt_options}"
 # run_cmd="NCCL_DEBUG=INFO /home/duanjiangfei/env/openmpi-2.1.6-cuda-10.1/bin/mpirun -np ${ndev} python -u pretrain_gpt2.py $@ ${gpt_options} --launch mpirun"
+srun -p pat_test -x SH-IDC1-10-198-4-[185] -n $ndev --gres=gpu:$g --tasks-per-node=$g \
+       ${CMD_PREFIX} python pretrain_gpt2.py ${gpt_options} ${CMD_SUFFIX} 2>&1 | tee log/${prefix}_${ndev}.log
 echo ${run_cmd}
 eval ${run_cmd}
 

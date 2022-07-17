@@ -463,8 +463,9 @@ def benchmark(model, optimizer, lr_scheduler, train_data_iterator, timers, args)
     skipped_iters = 0
 
     timers('interval time').start()
+    torch.cuda.reset_max_memory_allocated(0)
     report_memory_flag = True
-    while iteration < 15:
+    while iteration < 50:
 
         lm_loss, skipped_iter = train_step(train_data_iterator,
                                            model,
